@@ -1,0 +1,407 @@
+#!/usr/bin/env bash
+# vpn-hub — всё в одном: свой WireGuard + агрегатор подписок + проверка живости
+# usage:
+#   sudo bash vpn-hub.sh install     — поставить всё
+#   sudo bash vpn-hub.sh refresh     — обновить подписку вручную
+#   sudo bash vpn-hub.sh status      — статус
+#   sudo bash vpn-hub.sh uninstall   — снести
+#   sudo bash vpn-hub.sh help
+set -euo pipefail
+
+# ============ НАСТРОЙКИ ============
+WG_IFACE="${WG_IFACE:-wg0}"
+WG_PORT="${WG_PORT:-51820}"
+WG_SERVER_IP="${WG_SERVER_IP:-10.8.0.1}"
+DNS="${DNS:-1.1.1.1}"
+OWN_CLIENT="${OWN_CLIENT:-own}"
+
+SUB_PORT="${SUB_PORT:-8080}"
+SUB_DIR="${SUB_DIR:-/var/www/vpn-hub}"
+SUB_FILE="${SUB_FILE:-${SUB_DIR}/sub.txt}"
+OWN_FILE="${SUB_DIR}/own.txt"
+MERGED_FILE="${SUB_DIR}/merged.txt"
+
+REFRESH_MIN="${REFRESH_MIN:-60}"
+CHECK_ALIVE="${CHECK_ALIVE:-1}"        # 1 = проверять живость, 0 = не проверять
+CHECK_PARALLEL="${CHECK_PARALLEL:-50}"  # потоков проверки
+CHECK_TIMEOUT="${CHECK_TIMEOUT:-3}"    # сек на сервер
+
+STATE_DIR="/etc/wireguard"
+SELF="$(readlink -f "$0")"
+
+# Публичные источники
+SOURCES=(
+  "https://raw.githubusercontent.com/barry-far/V2ray-Config/main/All_Configs_Sub.txt"
+  "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt"
+  "https://raw.githubusercontent.com/mahdibland/ShadowsocksAggregator/master/Eternity.txt"
+  "https://raw.githubusercontent.com/ALIILAPRO/v2rayNG-Config/main/server.txt"
+  "https://raw.githubusercontent.com/freefq/free/master/v2"
+)
+
+# ============ ЦВЕТА ============
+if [[ -t 1 ]]; then
+  RED=$'\e[31m'; GRN=$'\e[32m'; YLW=$'\e[33m'; CYN=$'\e[36m'; RST=$'\e[0m'
+else
+  RED=""; GRN=""; YLW=""; CYN=""; RST=""
+fi
+log()  { echo "${GRN}[+]${RST} $*"; }
+warn() { echo "${YLW}[!]${RST} $*"; }
+die()  { echo "${RED}[x]${RST} $*" >&2; exit 1; }
+hr()   { echo "${CYN}──────────────────────────────────────────────${RST}"; }
+need_root() { [[ $EUID -eq 0 ]] || die "Запусти от root: sudo $SELF $*"; }
+
+# ============ ЗАВИСИМОСТИ ============
+ensure_deps() {
+  local pkgs=(curl jq nginx wireguard wireguard-tools qrencode iptables iptables-persistent)
+  local missing=()
+  for p in "${pkgs[@]}"; do
+    dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    log "Устанавливаю: ${missing[*]}"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y "${missing[@]}"
+  fi
+}
+
+ext_iface() { ip -4 route ls default | grep -Po '(?<=dev )(\S+)' | head -1; }
+public_ip() { curl -s4 --max-time 5 ifconfig.me || hostname -I | awk '{print $1}'; }
+
+# ============ СВОЙ WIREGUARD ============
+setup_wireguard() {
+  log "Настраиваю свой WireGuard..."
+  cat >/etc/sysctl.d/99-vpn-hub.conf <<EOF
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+EOF
+  sysctl --system >/dev/null
+
+  mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
+  cd "$STATE_DIR"
+  if [[ ! -f server_private.key ]]; then
+    umask 077
+    wg genkey | tee server_private.key | wg pubkey > server_public.key
+  fi
+  local server_priv server_pub ext
+  server_priv=$(cat server_private.key)
+  server_pub=$(cat server_public.key)
+  ext=$(ext_iface)
+  [[ -n "$ext" ]] || die "Не нашёл внешний интерфейс"
+
+  # сохраняем пиров при переустановке
+  local peers=""
+  [[ -f "${WG_IFACE}.conf" ]] && peers=$(awk '/^\[Peer\]/{p=1} p' "${WG_IFACE}.conf" || true)
+
+  cat >"${WG_IFACE}.conf" <<EOF
+[Interface]
+Address = ${WG_SERVER_IP}/24
+ListenPort = ${WG_PORT}
+PrivateKey = ${server_priv}
+PostUp   = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ${ext} -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${ext} -j MASQUERADE
+EOF
+  chmod 600 "${WG_IFACE}.conf"
+  [[ -n "$peers" ]] && printf '%s\n' "$peers" >>"${WG_IFACE}.conf"
+
+  systemctl enable --now "wg-quick@${WG_IFACE}" >/dev/null 2>&1 || true
+  systemctl restart "wg-quick@${WG_IFACE}"
+  netfilter-persistent save >/dev/null 2>&1 || true
+
+  # создаём своего клиента
+  if ! grep -q "^# ${OWN_CLIENT}\$" "${WG_IFACE}.conf"; then
+    log "Создаю своего клиента '${OWN_CLIENT}'..."
+    local cpriv cpub cpsk cip endpoint
+    cpriv=$(wg genkey); cpub=$(echo "$cpriv" | wg pubkey); cpsk=$(wg genpsk)
+    cip="10.8.0.2"
+    endpoint=$(public_ip)
+
+    cat >>"${WG_IFACE}.conf" <<EOF
+
+[Peer]
+# ${OWN_CLIENT}
+PublicKey = ${cpub}
+PresharedKey = ${cpsk}
+AllowedIPs = ${cip}/32
+EOF
+    wg syncconf "${WG_IFACE}" <(wg-quick strip "${WG_IFACE}")
+
+    mkdir -p "$SUB_DIR"
+    # WireGuard-конфиг (для клиента WireGuard)
+    cat >"${SUB_DIR}/${OWN_CLIENT}.conf" <<EOF
+[Interface]
+PrivateKey = ${cpriv}
+Address = ${cip}/24
+DNS = ${DNS}
+
+[Peer]
+PublicKey = ${server_pub}
+PresharedKey = ${cpsk}
+Endpoint = ${endpoint}:${WG_PORT}
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+EOF
+    chmod 600 "${SUB_DIR}/${OWN_CLIENT}.conf"
+
+    # base64 — универсальный формат подписки для многих клиентов
+    base64 -w0 "${SUB_DIR}/${OWN_CLIENT}.conf" >"${OWN_FILE}"
+  else
+    [[ -f "${SUB_DIR}/${OWN_CLIENT}.conf" ]] \
+      && base64 -w0 "${SUB_DIR}/${OWN_CLIENT}.conf" >"${OWN_FILE}" \
+      || true
+  fi
+}
+
+# ============ АГРЕГАТОР ============
+fetch_sources() {
+  local tmp; tmp=$(mktemp)
+  : >"$tmp"
+  for url in "${SOURCES[@]}"; do
+    echo "${YLW}→${RST} $url"
+    curl -fsSL --max-time 25 "$url" 2>/dev/null \
+      | grep -Eo '(vless|vmess|trojan|ss|ssr)://[^[:space:]]+' >>"$tmp" || true
+  done
+  sort -u "$tmp" -o "$tmp"
+  echo "$tmp"
+}
+
+check_alive_one() {
+  local line="$1"
+  local host port
+  host=$(echo "$line" | grep -oP '(?<=@)\[?[^]:?]+\]?(?=:|\?)' | tr -d '[]' | head -1)
+  [[ -z "$host" ]] && host=$(echo "$line" | grep -oP '(?<=://)[^@]+@\K[^:?]+' | head -1)
+  port=$(echo "$line" | grep -oP '(?<=@)[^:?]+:\K\d+' | head -1)
+  [[ -z "$host" || -z "$port" ]] && return 1
+  timeout "$CHECK_TIMEOUT" bash -c "cat < /dev/null > /dev/tcp/$host/$port" 2>/dev/null
+}
+export -f check_alive_one
+
+filter_alive() {
+  local input="$1" output="$2"
+  local total ok
+  total=$(wc -l <"$input")
+  log "Проверяю живость: $total серверов, ${CHECK_PARALLEL} потоков, таймаут ${CHECK_TIMEOUT}s"
+  : >"$output"
+  # параллельная проверка: каждый живой конфиг — на stdout
+  xargs -a "$input" -P "$CHECK_PARALLEL" -I{} bash -c \
+    'check_alive_one "$1" && printf "%s\n" "$1"' _ "{}" \
+    >>"$output" 2>/dev/null || true
+  ok=$(wc -l <"$output")
+  log "Живых: $ok / $total"
+}
+
+refresh() {
+  mkdir -p "$SUB_DIR"
+  log "Обновляю подписку..."
+  local raw; raw=$(fetch_sources)
+  local total; total=$(wc -l <"$raw")
+  log "Собрано конфигов: $total"
+
+  local chosen="$raw"
+  if [[ "$CHECK_ALIVE" == "1" ]]; then
+    local alive; alive=$(mktemp)
+    filter_alive "$raw" "$alive"
+    chosen="$alive"
+  fi
+
+  # свои (WireGuard b64) + чужие (vless/vmess/...) в одну подписку
+  local merged; merged=$(mktemp)
+  : >"$merged"
+  [[ -s "$OWN_FILE" ]] && cat "$OWN_FILE" >>"$merged" && echo >>"$merged"
+  cat "$chosen" >>"$merged"
+  sort -u "$merged" -o "$MERGED_FILE"
+  rm -f "$raw" "$merged" "$chosen" 2>/dev/null || true
+
+  log "Итоговая подписка: $MERGED_FILE ($(wc -l <"$MERGED_FILE") строк)"
+}
+
+# ============ NGINX ============
+setup_nginx() {
+  log "Настраиваю nginx на порту ${SUB_PORT}..."
+  mkdir -p "$SUB_DIR"
+  cat >/etc/nginx/sites-available/vpn-hub <<EOF
+server {
+  listen ${SUB_PORT} default_server;
+  root ${SUB_DIR};
+
+  location = /sub {
+    alias ${MERGED_FILE};
+    default_type text/plain;
+    add_header Cache-Control "no-store";
+  }
+  location = /own {
+    alias ${OWN_FILE};
+    default_type text/plain;
+  }
+  location = /health { return 200 "ok\n"; }
+  location / { return 200 "vpn-hub\n"; }
+}
+EOF
+  ln -sf /etc/nginx/sites-available/vpn-hub /etc/nginx/sites-enabled/vpn-hub
+  # не трогаем дефолт, чтобы не сломать чужие сайты
+  nginx -t && systemctl reload nginx
+}
+
+# ============ TIMER ============
+setup_timer() {
+  log "Ставлю таймер обновления каждые ${REFRESH_MIN} мин..."
+  cat >/etc/systemd/system/vpn-hub-refresh.service <<EOF
+[Unit]
+Description=vpn-hub subscription refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=SUB_DIR=${SUB_DIR}
+Environment=CHECK_ALIVE=${CHECK_ALIVE}
+Environment=CHECK_PARALLEL=${CHECK_PARALLEL}
+Environment=CHECK_TIMEOUT=${CHECK_TIMEOUT}
+ExecStart=${SELF} refresh
+EOF
+
+  cat >/etc/systemd/system/vpn-hub-refresh.timer <<EOF
+[Unit]
+Description=Run vpn-hub refresh every ${REFRESH_MIN} min
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${REFRESH_MIN}min
+Unit=vpn-hub-refresh.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now vpn-hub-refresh.timer >/dev/null 2>&1
+}
+
+# ============ КОМАНДЫ ============
+cmd_install() {
+  need_root install
+  ensure_deps
+  setup_wireguard
+  setup_nginx
+  refresh
+  setup_timer
+
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q active; then
+    ufw allow 22/tcp         >/dev/null 2>&1 || true
+    ufw allow 80/tcp         >/dev/null 2>&1 || true
+    ufw allow "${SUB_PORT}"/tcp >/dev/null 2>&1 || true
+    ufw allow "${WG_PORT}"/udp >/dev/null 2>&1 || true
+  fi
+
+  local IP; IP=$(public_ip)
+  hr
+  echo "${GRN}  VPN-HUB готов${RST}"
+  hr
+  echo "  Подписка (вставь в клиент):"
+  echo "    http://${IP}:${SUB_PORT}/sub"
+  echo
+  echo "  Только свой WireGuard:"
+  echo "    http://${IP}:${SUB_PORT}/own"
+  echo
+  echo "  Свой сервер: ${IP}:${WG_PORT} (UDP)"
+  echo
+  echo "  Управление:"
+  echo "    sudo $SELF refresh"
+  echo "    sudo $SELF status"
+  echo "    sudo $SELF uninstall"
+  hr
+  echo "  Клиенты: v2rayNG / Hiddify / Nekoray / Streisand"
+  echo "  → Subscriptions → Add → вставь ссылку → Update"
+  hr
+
+  if [[ -f "${SUB_DIR}/${OWN_CLIENT}.conf" ]]; then
+    echo "  QR своего WireGuard (для приложения WireGuard):"
+    qrencode -t ansiutf8 <"${SUB_DIR}/${OWN_CLIENT}.conf" || true
+  fi
+}
+
+cmd_refresh() {
+  need_root refresh
+  refresh
+}
+
+cmd_status() {
+  need_root status
+  hr
+  echo "${GRN}  Статус vpn-hub${RST}"
+  hr
+  systemctl is-active "wg-quick@${WG_IFACE}" >/dev/null 2>&1 \
+    && echo "  WireGuard:  ${GRN}active${RST}" \
+    || echo "  WireGuard:  ${RED}inactive${RST}"
+  systemctl is-active vpn-hub-refresh.timer >/dev/null 2>&1 \
+    && echo "  Таймер:     ${GRN}active${RST}" \
+    || echo "  Таймер:     ${RED}inactive${RST}"
+  systemctl is-active nginx >/dev/null 2>&1 \
+    && echo "  nginx:      ${GRN}active${RST}" \
+    || echo "  nginx:      ${RED}inactive${RST}"
+  echo "  Подписка:   $(public_ip):${SUB_PORT}/sub"
+  echo "  Конфигов:   $(wc -l <"$MERGED_FILE" 2>/dev/null || echo 0)"
+  hr
+  wg show "${WG_IFACE}" 2>/dev/null || echo "  Интерфейс не поднят"
+  hr
+}
+
+cmd_uninstall() {
+  need_root uninstall
+  read -rp "Удалить vpn-hub (WireGuard, nginx-сайт, таймер, конфиги)? [y/N] " ans
+  [[ "${ans,,}" == "y" ]] || { echo "Отмена"; exit 0; }
+  systemctl disable --now vpn-hub-refresh.timer 2>/dev/null || true
+  rm -f /etc/systemd/system/vpn-hub-refresh.{service,timer}
+  systemctl daemon-reload
+  systemctl disable --now "wg-quick@${WG_IFACE}" 2>/dev/null || true
+  rm -f /etc/nginx/sites-enabled/vpn-hub /etc/nginx/sites-available/vpn-hub
+  nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
+  rm -rf "$SUB_DIR"
+  rm -rf "$STATE_DIR"
+  rm -f /etc/sysctl.d/99-vpn-hub.conf
+  sysctl --system >/dev/null 2>&1 || true
+  log "Удалено"
+}
+
+cmd_help() {
+  cat <<EOF
+${CYN}vpn-hub${RST} — WireGuard + агрегатор подписок в одном скрипте
+
+Использование:
+  $SELF install     Установить (свой WG + подписка + таймер)
+  $SELF refresh     Обновить подписку вручную
+  $SELF status      Статус служб и количество конфигов
+  $SELF uninstall   Удалить всё
+  $SELF help        Справка
+
+Переменные окружения:
+  SUB_PORT=8080           порт HTTP-подписки
+  WG_PORT=51820           UDP-порт своего WireGuard
+  REFRESH_MIN=60          период обновления подписки
+  CHECK_ALIVE=1           проверять живость (0/1)
+  CHECK_PARALLEL=50       потоков проверки
+  CHECK_TIMEOUT=3         сек таймаут на сервер
+  DNS=1.1.1.1             DNS для клиента
+  OWN_CLIENT=own          имя своего клиента
+
+Примеры:
+  sudo bash $SELF install
+  sudo CHECK_ALIVE=0 bash $SELF install           # быстро, без проверки
+  sudo SUB_PORT=80 REFRESH_MIN=15 bash $SELF install
+EOF
+}
+
+# ============ MAIN ============
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    install)   cmd_install "$@" ;;
+    refresh)   cmd_refresh "$@" ;;
+    status)    cmd_status "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *) die "Неизвестная команда: $cmd. Смотри $SELF help" ;;
+  esac
+}
+
+main "$@"
