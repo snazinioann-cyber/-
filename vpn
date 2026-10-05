@@ -1,0 +1,123 @@
+{
+    "ip": "93.123.227.163",
+    "country_code": "RU",
+    "country_name": "Russian Federation",
+    "region_name": "Moskva",
+    "district": "Moskva",
+    "city_name": "Moscow",
+    "latitude": 55.75226,
+    "longitude": 37.61547,
+    "zip_code": "141170",
+    "time_zone": "+03:00",
+    "asn": "35539",
+    "as": "Information and Communication Technologies LLC",
+    "as_info": {
+        "as_number": "35539",
+        "as_name": "Information and Communication Technologies LLC",
+        "as_domain": "infolink.ru",
+        "as_usage_type": "ISP",
+        "as_cidr": "93.123.128.0/17"
+    },
+    "isp": "Information and Communication Technologies LLC",
+    "domain": "infolink.ru",
+    "net_speed": "DSL",
+    "idd_code": "7",
+    "area_code": "0495",
+    "weather_station_code": "RSXX0063",
+    "weather_station_name": "Moscow",
+    "mcc": "-",
+    "mnc": "-",
+    "mobile_brand": "-",
+    "elevation": 147,
+    "usage_type": "ISP",
+    "address_type": "Unicast",
+    "ads_category": "419",
+    "ads_category_name": "Internet Service Providers",
+    "continent": {
+        "name": "Europe",
+        "code": "EU",
+        "hemisphere": [
+            "north",
+            "east"
+        ],
+        "translation": {
+            "lang": null,
+            "value": null
+        }
+    },
+    "country": {
+        "name": "Russian Federation",
+        "alpha3_code": "RUS",
+        "numeric_code": 643,
+        "demonym": "Russians",
+        "flag": "https://cdn.ip2location.io/assets/img/flags/ru.png",
+        "capital": "Moscow",
+        "total_area": 17098242,
+        "population": 141505279,
+        "currency": {
+            "code": "RUB",
+            "name": "Russian Rouble",
+            "symbol": "\u20bd"
+        },
+        "language": {
+            "code": "RU",
+            "name": "Russian"
+        },
+        "tld": "ru",
+        "translation": {
+            "lang": null,
+            "value": null
+        }
+    },
+    "region": {
+        "name": "Moskva",
+        "code": "RU-MOW",
+        "translation": {
+            "lang": null,
+            "value": null
+        }
+    },
+    "city": {
+        "name": "Moscow",
+        "translation": {
+            "lang": null,
+            "value": null
+        }
+    },
+    "time_zone_info": {
+        "olson": "Europe/Moscow",
+        "current_time": "2026-10-05T19:37:30+03:00",
+        "gmt_offset": 10800,
+        "is_dst": false,
+        "abbreviation": "MSK",
+        "dst_start_date": null,
+        "dst_end_date": null,
+        "sunrise": "06:40",
+        "sunset": "17:57"
+    },
+    "geotargeting": {
+        "metro": null
+    },
+    "is_proxy": false,
+    "fraud_score": 0,
+    "proxy": {
+        "last_seen": 0,
+        "proxy_type": "-",
+        "threat": "-",
+        "provider": "-",
+        "is_vpn": false,
+        "is_tor": false,
+        "is_data_center": false,
+        "is_public_proxy": false,
+        "is_web_proxy": false,
+        "is_web_crawler": false,
+        "is_ai_crawler": false,
+        "is_residential_proxy": false,
+        "is_consumer_privacy_network": false,
+        "is_enterprise_private_network": false,
+        "is_spammer": false,
+        "is_scanner": false,
+        "is_botnet": false,
+        "is_bogon": false
+    }
+}
